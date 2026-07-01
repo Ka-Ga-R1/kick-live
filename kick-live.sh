@@ -16,13 +16,28 @@ SERVICE_FILE="/etc/systemd/system/kick-live@.service"
 NGINX_SITE="/etc/nginx/sites-available/kick-live"
 NGINX_ENABLED="/etc/nginx/sites-enabled/kick-live"
 
-DEFAULT_DOMAIN="kick.jamyoung.top"
+DEFAULT_DOMAIN="kick.example.com"
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        echo "请使用 root 运行：sudo bash $0"
+        echo "请使用 root 用户运行。"
         exit 1
     fi
+}
+
+validate_domain() {
+    local domain="$1"
+    [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
+}
+
+validate_channel() {
+    local channel="$1"
+    [[ "$channel" =~ ^[A-Za-z0-9_-]{1,64}$ ]]
+}
+
+validate_name() {
+    local name="$1"
+    [[ "$name" =~ ^[a-z0-9_-]{1,64}$ ]]
 }
 
 pause() {
@@ -38,17 +53,40 @@ ensure_dirs() {
 load_config() {
     DOMAIN="$DEFAULT_DOMAIN"
     if [ -f "$CONFIG_FILE" ]; then
-        # shellcheck disable=SC1090
-        source "$CONFIG_FILE"
+        while IFS='=' read -r key value; do
+            case "$key" in
+                DOMAIN) DOMAIN="$value" ;;
+            esac
+        done < "$CONFIG_FILE"
     fi
+    if ! validate_domain "$DOMAIN"; then
+        DOMAIN="$DEFAULT_DOMAIN"
+    fi
+}
+
+load_stream_config() {
+    local env_file="$1"
+    CHANNEL=""
+    NAME=""
+    QUALITY_LABEL=""
+    TARGET_HEIGHT=""
+    TARGET_FPS=""
+    while IFS='=' read -r key value; do
+        case "$key" in
+            CHANNEL) CHANNEL="$value" ;;
+            NAME) NAME="$value" ;;
+            QUALITY_LABEL) QUALITY_LABEL="$value" ;;
+            TARGET_HEIGHT) TARGET_HEIGHT="$value" ;;
+            TARGET_FPS) TARGET_FPS="$value" ;;
+        esac
+    done < "$env_file"
 }
 
 save_domain() {
     local domain="$1"
     mkdir -p "$CONFIG_DIR"
-    cat > "$CONFIG_FILE" <<EOF
-DOMAIN="$domain"
-EOF
+    printf 'DOMAIN=%s\n' "$domain" > "$CONFIG_FILE"
+    chmod 0644 "$CONFIG_FILE"
 }
 
 is_installed() {
@@ -150,6 +188,10 @@ install_or_update() {
     apt update
     apt install -y nginx ffmpeg python3 python3-pip certbot python3-certbot-nginx ca-certificates curl
 
+    if id -u www-data >/dev/null 2>&1; then
+        chown -R www-data:www-data "$LIVE_ROOT" 2>/dev/null || true
+    fi
+
     if python3 -m pip --version >/dev/null 2>&1; then
         python3 -m pip install -U yt-dlp --break-system-packages
     else
@@ -162,7 +204,7 @@ install_or_update() {
     chmod +x "$MANAGER_BIN" "$WORKER_BIN"
     systemctl daemon-reload
     systemctl enable --now nginx
-    echo "环境安装/更新完成。以后可运行：sudo kick-live"
+    echo "环境安装/更新完成。以后可运行：kick-live"
     pause
 }
 
@@ -174,13 +216,29 @@ set -u
 NAME="${1:-}"
 CONFIG_FILE="/etc/kick-live/streams/${NAME}.env"
 
-if [ -z "$NAME" ] || [ ! -f "$CONFIG_FILE" ]; then
+if ! [[ "$NAME" =~ ^[a-z0-9_-]{1,64}$ ]] || [ ! -f "$CONFIG_FILE" ]; then
     echo "Stream config not found: ${CONFIG_FILE}"
     exit 1
 fi
 
-# shellcheck disable=SC1090
-source "$CONFIG_FILE"
+CHANNEL=""
+QUALITY_LABEL=""
+TARGET_HEIGHT=""
+TARGET_FPS=""
+
+while IFS='=' read -r key value; do
+    case "$key" in
+        CHANNEL) CHANNEL="$value" ;;
+        QUALITY_LABEL) QUALITY_LABEL="$value" ;;
+        TARGET_HEIGHT) TARGET_HEIGHT="$value" ;;
+        TARGET_FPS) TARGET_FPS="$value" ;;
+    esac
+done < "$CONFIG_FILE"
+
+if [ -z "$CHANNEL" ]; then
+    echo "Invalid stream config: ${CONFIG_FILE}"
+    exit 1
+fi
 
 OUT_DIR="/var/www/html/live/${NAME}"
 KICK_URL="https://kick.com/${CHANNEL}"
@@ -304,7 +362,11 @@ Type=simple
 ExecStart=${WORKER_BIN} %i
 Restart=always
 RestartSec=10
-User=root
+User=www-data
+Group=www-data
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -318,11 +380,17 @@ uninstall_env() {
 
     while IFS= read -r env_file; do
         name="$(basename "$env_file" .env)"
+        validate_name "$name" || continue
         systemctl disable --now "kick-live@${name}" 2>/dev/null || true
     done < <(find "$STREAM_DIR" -maxdepth 1 -type f -name '*.env' 2>/dev/null)
 
     rm -f "$WORKER_BIN" "$MANAGER_BIN" "$SERVICE_FILE" "$NGINX_ENABLED" "$NGINX_SITE" "$PLAYLIST_FILE"
-    rm -rf "$CONFIG_DIR" "$LIVE_ROOT"
+    if [ "$CONFIG_DIR" = "/etc/kick-live" ]; then
+        rm -rf -- "$CONFIG_DIR"
+    fi
+    if [ "$LIVE_ROOT" = "/var/www/html/live" ]; then
+        rm -rf -- "$LIVE_ROOT"
+    fi
     systemctl daemon-reload
     systemctl reload nginx 2>/dev/null || true
     echo "卸载完成。依赖软件 nginx/ffmpeg/yt-dlp 未删除。"
@@ -334,6 +402,11 @@ configure_domain_https() {
     load_config
     read -r -p "请输入域名 [${DOMAIN:-$DEFAULT_DOMAIN}]: " input_domain
     input_domain="${input_domain:-${DOMAIN:-$DEFAULT_DOMAIN}}"
+    if ! validate_domain "$input_domain"; then
+        echo "域名格式无效。"
+        pause
+        return
+    fi
     save_domain "$input_domain"
     DOMAIN="$input_domain"
     write_nginx_config
@@ -521,13 +594,18 @@ add_stream() {
         pause
         return
     fi
+    if ! validate_channel "$channel"; then
+        echo "频道名只能包含字母、数字、下划线和短横线。"
+        pause
+        return
+    fi
 
     default_name="$(sanitize_name "$channel")"
     read -r -p "请输入本地名称/目录名 [${default_name}]: " name
     name="${name:-$default_name}"
     name="$(sanitize_name "$name")"
 
-    if [ -z "$name" ]; then
+    if ! validate_name "$name"; then
         echo "本地名称无效。"
         pause
         return
@@ -545,13 +623,14 @@ add_stream() {
     fi
 
     mkdir -p "${LIVE_ROOT}/${name}"
-    cat > "${STREAM_DIR}/${name}.env" <<EOF
-CHANNEL="${channel}"
-NAME="${name}"
-QUALITY_LABEL="${SELECTED_LABEL}"
-TARGET_HEIGHT="${SELECTED_HEIGHT}"
-TARGET_FPS="${SELECTED_FPS}"
-EOF
+    {
+        printf 'CHANNEL=%s\n' "$channel"
+        printf 'NAME=%s\n' "$name"
+        printf 'QUALITY_LABEL=%s\n' "$SELECTED_LABEL"
+        printf 'TARGET_HEIGHT=%s\n' "$SELECTED_HEIGHT"
+        printf 'TARGET_FPS=%s\n' "$SELECTED_FPS"
+    } > "${STREAM_DIR}/${name}.env"
+    chmod 0644 "${STREAM_DIR}/${name}.env"
 
     chown -R www-data:www-data "${LIVE_ROOT}/${name}" 2>/dev/null || true
     systemctl daemon-reload
@@ -562,7 +641,12 @@ EOF
 }
 
 stream_menu_items() {
-    find "$STREAM_DIR" -maxdepth 1 -type f -name '*.env' 2>/dev/null | sort
+    find "$STREAM_DIR" -maxdepth 1 -type f -name '*.env' 2>/dev/null | sort | while IFS= read -r env_file; do
+        name="$(basename "$env_file" .env)"
+        if validate_name "$name"; then
+            printf '%s\n' "$env_file"
+        fi
+    done
 }
 
 choose_stream() {
@@ -579,8 +663,7 @@ choose_stream() {
     echo "请选择直播间："
     for env_file in "${files[@]}"; do
         name="$(basename "$env_file" .env)"
-        # shellcheck disable=SC1090
-        source "$env_file"
+        load_stream_config "$env_file"
         if service_is_active "kick-live@${name}"; then
             status="运行中"
         else
@@ -621,9 +704,9 @@ manage_single_stream() {
     local name="$1"
     local env_file="${STREAM_DIR}/${name}.env"
     local choice
+    validate_name "$name" || return
     [ -f "$env_file" ] || return
-    # shellcheck disable=SC1090
-    source "$env_file"
+    load_stream_config "$env_file"
 
     while true; do
         clear_screen
@@ -645,7 +728,7 @@ EOF
             1) systemctl start "kick-live@${name}"; echo "已启动。"; pause ;;
             2) systemctl stop "kick-live@${name}"; echo "已停止。"; pause ;;
             3) systemctl restart "kick-live@${name}"; echo "已重启。"; pause ;;
-            4) change_quality "$name"; source "$env_file" ;;
+            4) change_quality "$name"; load_stream_config "$env_file" ;;
             5) systemctl status "kick-live@${name}" --no-pager; pause ;;
             6) journalctl -u "kick-live@${name}" -f ;;
             7) remove_stream "$name"; return ;;
@@ -658,19 +741,20 @@ EOF
 change_quality() {
     local name="$1"
     local env_file="${STREAM_DIR}/${name}.env"
-    # shellcheck disable=SC1090
-    source "$env_file"
+    validate_name "$name" || { echo "本地名称无效。"; pause; return; }
+    load_stream_config "$env_file"
     if ! select_quality "$CHANNEL"; then
         pause
         return
     fi
-    cat > "$env_file" <<EOF
-CHANNEL="${CHANNEL}"
-NAME="${name}"
-QUALITY_LABEL="${SELECTED_LABEL}"
-TARGET_HEIGHT="${SELECTED_HEIGHT}"
-TARGET_FPS="${SELECTED_FPS}"
-EOF
+    {
+        printf 'CHANNEL=%s\n' "$CHANNEL"
+        printf 'NAME=%s\n' "$name"
+        printf 'QUALITY_LABEL=%s\n' "$SELECTED_LABEL"
+        printf 'TARGET_HEIGHT=%s\n' "$SELECTED_HEIGHT"
+        printf 'TARGET_FPS=%s\n' "$SELECTED_FPS"
+    } > "$env_file"
+    chmod 0644 "$env_file"
     systemctl restart "kick-live@${name}"
     generate_playlist
     echo "清晰度已修改为：${SELECTED_LABEL}"
@@ -679,12 +763,15 @@ EOF
 
 remove_stream() {
     local name="$1"
+    validate_name "$name" || { echo "本地名称无效，拒绝删除。"; pause; return; }
     echo "将删除直播间：$name"
     read -r -p "确认删除？输入 YES 继续: " confirm
     [ "$confirm" = "YES" ] || { echo "已取消。"; pause; return; }
     systemctl disable --now "kick-live@${name}" 2>/dev/null || true
     rm -f "${STREAM_DIR}/${name}.env"
-    rm -rf "${LIVE_ROOT:?}/${name}"
+    if [ "$LIVE_ROOT" = "/var/www/html/live" ]; then
+        rm -rf -- "${LIVE_ROOT}/${name}"
+    fi
     generate_playlist
     echo "已删除：$name"
     pause
@@ -700,8 +787,7 @@ EOF
 
     while IFS= read -r env_file; do
         name="$(basename "$env_file" .env)"
-        # shellcheck disable=SC1090
-        source "$env_file"
+        load_stream_config "$env_file"
         cat >> "$PLAYLIST_FILE" <<EOF
 #EXTINF:-1 tvg-id="${name}" tvg-name="${CHANNEL}" group-title="Kick",${CHANNEL} - ${QUALITY_LABEL}
 https://${DOMAIN}/live/${name}/index.m3u8
@@ -722,8 +808,7 @@ show_global_status() {
     echo
     while IFS= read -r env_file; do
         name="$(basename "$env_file" .env)"
-        # shellcheck disable=SC1090
-        source "$env_file"
+        load_stream_config "$env_file"
         if service_is_active "kick-live@${name}"; then
             status="运行中"
         else
@@ -748,9 +833,8 @@ view_realtime_logs() {
 }
 
 clear_logs() {
-    journalctl --rotate
-    journalctl --vacuum-time=1s
-    echo "日志已清理。"
+    echo "systemd journal 不支持只清理单个服务日志。"
+    echo "为避免影响整台服务器，脚本不会执行全局日志清理。"
     pause
 }
 
