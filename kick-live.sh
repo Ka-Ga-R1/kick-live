@@ -48,6 +48,44 @@ pause() {
 ensure_dirs() {
     mkdir -p "$CONFIG_DIR" "$STREAM_DIR" "$LIVE_ROOT"
     touch "$CONFIG_FILE"
+    fix_permissions
+}
+
+fix_permissions() {
+    chown root:root "$CONFIG_DIR" "$STREAM_DIR" "$CONFIG_FILE" 2>/dev/null || true
+    chmod 0755 "$CONFIG_DIR" "$STREAM_DIR" 2>/dev/null || true
+    chmod 0644 "$CONFIG_FILE" 2>/dev/null || true
+
+    if [ -d "$STREAM_DIR" ]; then
+        find "$STREAM_DIR" -maxdepth 1 -type f -name '*.env' -exec chown root:root {} \; -exec chmod 0644 {} \; 2>/dev/null || true
+    fi
+
+    if [ -f "$MANAGER_BIN" ]; then
+        chown root:root "$MANAGER_BIN" 2>/dev/null || true
+        chmod 0755 "$MANAGER_BIN" 2>/dev/null || true
+    fi
+    if [ -f "$WORKER_BIN" ]; then
+        chown root:root "$WORKER_BIN" 2>/dev/null || true
+        chmod 0755 "$WORKER_BIN" 2>/dev/null || true
+    fi
+    if [ -f "$SERVICE_FILE" ]; then
+        chown root:root "$SERVICE_FILE" 2>/dev/null || true
+        chmod 0644 "$SERVICE_FILE" 2>/dev/null || true
+    fi
+    if [ -f "$NGINX_SITE" ]; then
+        chown root:root "$NGINX_SITE" 2>/dev/null || true
+        chmod 0644 "$NGINX_SITE" 2>/dev/null || true
+    fi
+
+    mkdir -p "$LIVE_ROOT"
+    chown -R www-data:www-data "$LIVE_ROOT" 2>/dev/null || true
+    find "$LIVE_ROOT" -type d -exec chmod 0755 {} \; 2>/dev/null || true
+    find "$LIVE_ROOT" -type f -exec chmod 0644 {} \; 2>/dev/null || true
+
+    if [ -f "$PLAYLIST_FILE" ]; then
+        chown www-data:www-data "$PLAYLIST_FILE" 2>/dev/null || true
+        chmod 0644 "$PLAYLIST_FILE" 2>/dev/null || true
+    fi
 }
 
 load_config() {
@@ -86,7 +124,7 @@ save_domain() {
     local domain="$1"
     mkdir -p "$CONFIG_DIR"
     printf 'DOMAIN=%s\n' "$domain" > "$CONFIG_FILE"
-    chmod 0644 "$CONFIG_FILE"
+    fix_permissions
 }
 
 is_installed() {
@@ -174,7 +212,7 @@ upgrade_script() {
     ensure_dirs
     if [ -f "$0" ]; then
         cp "$0" "$MANAGER_BIN"
-        chmod +x "$MANAGER_BIN"
+        fix_permissions
         echo "脚本已安装/升级到：$MANAGER_BIN"
     else
         echo "无法定位当前脚本文件。"
@@ -188,10 +226,6 @@ install_or_update() {
     apt update
     apt install -y nginx ffmpeg python3 python3-pip certbot python3-certbot-nginx ca-certificates curl
 
-    if id -u www-data >/dev/null 2>&1; then
-        chown -R www-data:www-data "$LIVE_ROOT" 2>/dev/null || true
-    fi
-
     if python3 -m pip --version >/dev/null 2>&1; then
         python3 -m pip install -U yt-dlp --break-system-packages
     else
@@ -201,7 +235,7 @@ install_or_update() {
     write_worker
     write_systemd_template
     cp "$0" "$MANAGER_BIN"
-    chmod +x "$MANAGER_BIN" "$WORKER_BIN"
+    fix_permissions
     systemctl daemon-reload
     systemctl enable --now nginx
     echo "环境安装/更新完成。以后可运行：kick-live"
@@ -245,7 +279,6 @@ KICK_URL="https://kick.com/${CHANNEL}"
 YTDLP_LOG="/tmp/kick-${NAME}-ytdlp.log"
 
 mkdir -p "$OUT_DIR"
-chown -R www-data:www-data "$OUT_DIR" 2>/dev/null || true
 
 choose_format() {
     local json_file selected
@@ -371,6 +404,7 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
+    fix_permissions
 }
 
 uninstall_env() {
@@ -464,6 +498,7 @@ server {
 EOF
     ln -sf "$NGINX_SITE" "$NGINX_ENABLED"
     rm -f /etc/nginx/sites-enabled/default
+    fix_permissions
 }
 
 show_playlist() {
@@ -630,9 +665,7 @@ add_stream() {
         printf 'TARGET_HEIGHT=%s\n' "$SELECTED_HEIGHT"
         printf 'TARGET_FPS=%s\n' "$SELECTED_FPS"
     } > "${STREAM_DIR}/${name}.env"
-    chmod 0644 "${STREAM_DIR}/${name}.env"
-
-    chown -R www-data:www-data "${LIVE_ROOT}/${name}" 2>/dev/null || true
+    fix_permissions
     systemctl daemon-reload
     systemctl enable --now "kick-live@${name}"
     generate_playlist
@@ -754,7 +787,7 @@ change_quality() {
         printf 'TARGET_HEIGHT=%s\n' "$SELECTED_HEIGHT"
         printf 'TARGET_FPS=%s\n' "$SELECTED_FPS"
     } > "$env_file"
-    chmod 0644 "$env_file"
+    fix_permissions
     systemctl restart "kick-live@${name}"
     generate_playlist
     echo "清晰度已修改为：${SELECTED_LABEL}"
@@ -794,7 +827,7 @@ https://${DOMAIN}/live/${name}/index.m3u8
 EOF
     done < <(stream_menu_items)
 
-    chown www-data:www-data "$PLAYLIST_FILE" 2>/dev/null || true
+    fix_permissions
     echo "播放列表已生成：${PLAYLIST_FILE}"
     echo "地址：https://${DOMAIN}/playlist.m3u"
 }
