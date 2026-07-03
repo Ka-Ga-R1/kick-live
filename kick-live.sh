@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
+CONFIG_VERSION="1"
+SERVICE_VERSION="2"
 APP_NAME="Kick 直播中转一键管理脚本"
 
 CONFIG_DIR="/etc/kick-live"
 STREAM_DIR="${CONFIG_DIR}/streams"
 CONFIG_FILE="${CONFIG_DIR}/config.env"
+VERSION_FILE="${CONFIG_DIR}/version.env"
 WEB_ROOT="/var/www/html"
 LIVE_ROOT="${WEB_ROOT}/live"
 PLAYLIST_FILE="${WEB_ROOT}/playlist.m3u"
@@ -55,6 +58,10 @@ fix_permissions() {
     chown root:root "$CONFIG_DIR" "$STREAM_DIR" "$CONFIG_FILE" 2>/dev/null || true
     chmod 0755 "$CONFIG_DIR" "$STREAM_DIR" 2>/dev/null || true
     chmod 0644 "$CONFIG_FILE" 2>/dev/null || true
+    if [ -f "$VERSION_FILE" ]; then
+        chown root:root "$VERSION_FILE" 2>/dev/null || true
+        chmod 0644 "$VERSION_FILE" 2>/dev/null || true
+    fi
 
     if [ -d "$STREAM_DIR" ]; then
         find "$STREAM_DIR" -maxdepth 1 -type f -name '*.env' -exec chown root:root {} \; -exec chmod 0644 {} \; 2>/dev/null || true
@@ -88,6 +95,16 @@ fix_permissions() {
     fi
 }
 
+write_version_file() {
+    mkdir -p "$CONFIG_DIR"
+    {
+        printf 'SCRIPT_VERSION=%s\n' "$VERSION"
+        printf 'CONFIG_VERSION=%s\n' "$CONFIG_VERSION"
+        printf 'SERVICE_VERSION=%s\n' "$SERVICE_VERSION"
+    } > "$VERSION_FILE"
+    fix_permissions
+}
+
 load_config() {
     DOMAIN="$DEFAULT_DOMAIN"
     if [ -f "$CONFIG_FILE" ]; then
@@ -118,6 +135,100 @@ load_stream_config() {
             TARGET_FPS) TARGET_FPS="$value" ;;
         esac
     done < "$env_file"
+}
+
+write_stream_config() {
+    local env_file="$1"
+    local channel="$2"
+    local name="$3"
+    local quality_label="$4"
+    local target_height="$5"
+    local target_fps="$6"
+
+    {
+        printf 'CHANNEL=%s\n' "$channel"
+        printf 'NAME=%s\n' "$name"
+        printf 'QUALITY_LABEL=%s\n' "$quality_label"
+        printf 'TARGET_HEIGHT=%s\n' "$target_height"
+        printf 'TARGET_FPS=%s\n' "$target_fps"
+    } > "$env_file"
+}
+
+migrate_stream_configs() {
+    local env_file name changed
+    while IFS= read -r env_file; do
+        name="$(basename "$env_file" .env)"
+        validate_name "$name" || { echo "跳过非法配置文件：$env_file"; continue; }
+
+        load_stream_config "$env_file"
+        changed=0
+
+        if [ -z "$NAME" ]; then
+            NAME="$name"
+            changed=1
+        fi
+        if [ -z "$QUALITY_LABEL" ]; then
+            QUALITY_LABEL="自动最佳"
+            changed=1
+        fi
+        if [ -z "$TARGET_HEIGHT" ]; then
+            TARGET_HEIGHT="0"
+            changed=1
+        fi
+        if [ -z "$TARGET_FPS" ]; then
+            TARGET_FPS="0"
+            changed=1
+        fi
+
+        if ! validate_channel "$CHANNEL"; then
+            echo "直播间配置异常，已跳过：$name"
+            continue
+        fi
+
+        if [ "$changed" = "1" ]; then
+            write_stream_config "$env_file" "$CHANNEL" "$NAME" "$QUALITY_LABEL" "$TARGET_HEIGHT" "$TARGET_FPS"
+            echo "已迁移配置：$name"
+        fi
+    done < <(find "$STREAM_DIR" -maxdepth 1 -type f -name '*.env' 2>/dev/null | sort)
+    fix_permissions
+}
+
+running_streams() {
+    local env_file name
+    while IFS= read -r env_file; do
+        name="$(basename "$env_file" .env)"
+        validate_name "$name" || continue
+        if service_is_active "kick-live@${name}"; then
+            printf '%s\n' "$name"
+        fi
+    done < <(stream_menu_items)
+}
+
+maybe_restart_running_streams() {
+    local streams=() name answer
+    while IFS= read -r name; do
+        streams+=("$name")
+    done < <(running_streams)
+
+    if [ "${#streams[@]}" -eq 0 ]; then
+        return
+    fi
+
+    echo
+    echo "检测到以下直播间正在运行："
+    for name in "${streams[@]}"; do
+        echo " - $name"
+    done
+    echo
+    read -r -p "是否重启这些直播间以应用新版本？[y/N]: " answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        for name in "${streams[@]}"; do
+            systemctl restart "kick-live@${name}"
+        done
+        echo "已重启运行中的直播间。"
+    else
+        echo "已跳过重启；这些直播间会在下次重启后使用新版本。"
+    fi
 }
 
 save_domain() {
@@ -211,9 +322,22 @@ EOF
 upgrade_script() {
     ensure_dirs
     if [ -f "$0" ]; then
+        echo "正在更新主脚本..."
         cp "$0" "$MANAGER_BIN"
+        echo "正在更新 worker..."
+        write_worker
+        echo "正在更新 systemd 模板..."
+        write_systemd_template
+        echo "正在检查直播间配置..."
+        migrate_stream_configs
+        echo "正在重新生成播放列表..."
+        generate_playlist
+        echo "正在写入版本信息..."
+        write_version_file
         fix_permissions
-        echo "脚本已安装/升级到：$MANAGER_BIN"
+        systemctl daemon-reload
+        maybe_restart_running_streams
+        echo "升级完成：v${VERSION}"
     else
         echo "无法定位当前脚本文件。"
     fi
@@ -235,6 +359,8 @@ install_or_update() {
     write_worker
     write_systemd_template
     cp "$0" "$MANAGER_BIN"
+    migrate_stream_configs
+    write_version_file
     fix_permissions
     systemctl daemon-reload
     systemctl enable --now nginx
@@ -249,6 +375,8 @@ set -u
 
 NAME="${1:-}"
 CONFIG_FILE="/etc/kick-live/streams/${NAME}.env"
+
+trap 'trap - TERM INT; kill -- -$$ 2>/dev/null; exit 0' TERM INT
 
 if ! [[ "$NAME" =~ ^[a-z0-9_-]{1,64}$ ]] || [ ! -f "$CONFIG_FILE" ]; then
     echo "Stream config not found: ${CONFIG_FILE}"
@@ -400,6 +528,11 @@ Group=www-data
 NoNewPrivileges=true
 ProtectHome=true
 PrivateTmp=true
+KillMode=control-group
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+TimeoutStopSec=10
+SendSIGKILL=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -658,13 +791,7 @@ add_stream() {
     fi
 
     mkdir -p "${LIVE_ROOT}/${name}"
-    {
-        printf 'CHANNEL=%s\n' "$channel"
-        printf 'NAME=%s\n' "$name"
-        printf 'QUALITY_LABEL=%s\n' "$SELECTED_LABEL"
-        printf 'TARGET_HEIGHT=%s\n' "$SELECTED_HEIGHT"
-        printf 'TARGET_FPS=%s\n' "$SELECTED_FPS"
-    } > "${STREAM_DIR}/${name}.env"
+    write_stream_config "${STREAM_DIR}/${name}.env" "$channel" "$name" "$SELECTED_LABEL" "$SELECTED_HEIGHT" "$SELECTED_FPS"
     fix_permissions
     systemctl daemon-reload
     systemctl enable --now "kick-live@${name}"
@@ -759,7 +886,7 @@ EOF
         read -r -p " 请输入数字 [0-7]: " choice
         case "$choice" in
             1) systemctl start "kick-live@${name}"; echo "已启动。"; pause ;;
-            2) systemctl stop "kick-live@${name}"; echo "已停止。"; pause ;;
+            2) systemctl stop "kick-live@${name}"; systemctl reset-failed "kick-live@${name}" 2>/dev/null || true; echo "已停止。"; pause ;;
             3) systemctl restart "kick-live@${name}"; echo "已重启。"; pause ;;
             4) change_quality "$name"; load_stream_config "$env_file" ;;
             5) systemctl status "kick-live@${name}" --no-pager; pause ;;
@@ -780,13 +907,7 @@ change_quality() {
         pause
         return
     fi
-    {
-        printf 'CHANNEL=%s\n' "$CHANNEL"
-        printf 'NAME=%s\n' "$name"
-        printf 'QUALITY_LABEL=%s\n' "$SELECTED_LABEL"
-        printf 'TARGET_HEIGHT=%s\n' "$SELECTED_HEIGHT"
-        printf 'TARGET_FPS=%s\n' "$SELECTED_FPS"
-    } > "$env_file"
+    write_stream_config "$env_file" "$CHANNEL" "$name" "$SELECTED_LABEL" "$SELECTED_HEIGHT" "$SELECTED_FPS"
     fix_permissions
     systemctl restart "kick-live@${name}"
     generate_playlist
