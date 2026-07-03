@@ -231,6 +231,26 @@ maybe_restart_running_streams() {
     fi
 }
 
+install_manager_script() {
+    local source_path source_real target_real
+    source_path="$0"
+
+    if [ ! -f "$source_path" ]; then
+        echo "无法定位当前脚本文件。"
+        return 1
+    fi
+
+    source_real="$(readlink -f "$source_path" 2>/dev/null || printf '%s' "$source_path")"
+    target_real="$(readlink -f "$MANAGER_BIN" 2>/dev/null || printf '%s' "$MANAGER_BIN")"
+
+    if [ "$source_real" = "$target_real" ]; then
+        echo "主脚本已在目标位置，跳过复制。"
+        return 0
+    fi
+
+    cp "$source_path" "$MANAGER_BIN"
+}
+
 save_domain() {
     local domain="$1"
     mkdir -p "$CONFIG_DIR"
@@ -323,7 +343,7 @@ upgrade_script() {
     ensure_dirs
     if [ -f "$0" ]; then
         echo "正在更新主脚本..."
-        cp "$0" "$MANAGER_BIN"
+        install_manager_script
         echo "正在更新 worker..."
         write_worker
         echo "正在更新 systemd 模板..."
@@ -358,7 +378,7 @@ install_or_update() {
 
     write_worker
     write_systemd_template
-    cp "$0" "$MANAGER_BIN"
+    install_manager_script
     migrate_stream_configs
     write_version_file
     fix_permissions
